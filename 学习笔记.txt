@@ -1,0 +1,442 @@
+https://github.com/nuptboyzhb/AndroidInstantRun
+
+1、替换manifest.xml中的Application为BootstrapApplication
+ <application
+        android:theme="@ref/0x7f070000"
+        android:label="@ref/0x7f060000"
+        android:icon="@ref/0x7f020000"
+        android:name="com.android.tools.fd.runtime.BootstrapApplication"
+        android:debuggable="true"
+        android:allowBackup="true"
+        android:supportsRtl="true"
+        name="com.instant_run.demo.MyApp">
+2、第一次打包的apk
+里面有2个dex文件和一个instant-run.zip文件
+1）classes.dex和classes2.dex
+classes.dex中包含instant-run框架的一些代码
+classes2.dex中只包含AppInfo
+com.android.tools.fd.runtime.AppInfo
+{
+ public static String applicationClass="com.instant_run.demo.MyApp"; //真实的Application
+ public static String applicationId="com.instant_run.demo"; //应用包名
+ public static boolean usingApkSplits=false;
+}
+2）instant-run.zip
+包含slice_0-classes.dex 到 slice_9-classes.dex  10个dex文件
+其中一个dex包含我们的业务代码
+可以看出Instant-Run代码作为一个宿主程序，将app作为资源dex加载起来，和插件化一个思路
+
+二、Instant-Run执行流程
+InstantRun启动app
+首先BootstrapApplication分析，按照执行顺序，依次分析attachBaseContext和onCreate方法。
+1.attachBaseContext方法
+我们依次需要关注的方法有：
+createResources → setupClassLoaders → createRealApplication → 调用realApplication的attachBaseContext方法
+1)、createResources
+该方法主要是判断资源resource.ap_是否改变，然后保存resource.ap_的路径到externalResourcePath中
+2)、setupClassLoaders
+创建加载dex文件的ClassLoader，并设置ClassLoader的父子顺序
+PathClassLoader----->BootClassLoader
+   修改为
+PathClassLoader----->IncrementalClassLoader----->BootClassLoader
+因此IncrementalClassLoader可以优先加载补丁dex类
+
+3)、createRealApplication
+根据AppInfo类的applicationClass创建真实的application。
+
+4)、调用realApplication的attachBaseContext方法
+代理realApplication的生命周期，通过反射调用realApplication的attachBaseContext方法，以当前的Context为参数。
+attachBaseContext方法执行结束之后，我们继续往下看，到BootstrapApplication的onCreate方法
+
+2.onCreate
+public void onCreate()
+  {
+    if (!AppInfo.usingApkSplits)
+    {
+      MonkeyPatcher.monkeyPatchApplication(this, this, this.realApplication, this.externalResourcePath);
+
+      MonkeyPatcher.monkeyPatchExistingResources(this, this.externalResourcePath, null);
+    }
+    else
+    {
+      MonkeyPatcher.monkeyPatchApplication(this, this, this.realApplication, null);
+    }
+    super.onCreate();
+    if (AppInfo.applicationId != null) {
+      try
+      {
+        boolean foundPackage = false;
+        int pid = Process.myPid();
+        ActivityManager manager = (ActivityManager)getSystemService("activity");
+
+        List<ActivityManager.RunningAppProcessInfo> processes = manager.getRunningAppProcesses();
+        boolean startServer;
+        if ((processes != null) && (processes.size() > 1))
+        {
+          boolean startServer = false;
+          for (ActivityManager.RunningAppProcessInfo processInfo : processes) {
+            if (AppInfo.applicationId.equals(processInfo.processName))
+            {
+              foundPackage = true;
+              if (processInfo.pid == pid)
+              {
+                startServer = true;
+                break;
+              }
+            }
+          }
+          if ((!startServer) && (!foundPackage))
+          {
+            startServer = true;
+            if (Log.isLoggable("InstantRun", 2)) {
+              Log.v("InstantRun", "Multiprocess but didn't find process with package: starting server anyway");
+            }
+          }
+        }
+        else
+        {
+          startServer = true;
+        }
+        if (startServer) {
+          Server.create(AppInfo.applicationId, this);
+        }
+      }
+      catch (Throwable t)
+      {
+        if (Log.isLoggable("InstantRun", 2)) {
+          Log.v("InstantRun", "Failed during multi process check", t);
+        }
+        Server.create(AppInfo.applicationId, this);
+      }
+    }
+    if (this.realApplication != null) {
+      this.realApplication.onCreate();
+    }
+  }
+}
+
+我们依次需要关注的方法有：
+monkeyPatchApplication → monkeyPatchExistingResources → Server启动 → 调用realApplication的onCreate方法
+1)monkeyPatchApplication
+该方法的目的可以总结为：替换所有当前app的application为realApplication。
+具体做的事情可以总结为：
+1.替换ActivityThread的mInitialApplication为realApplication
+2.替换mAllApplications 中所有的Application为realApplication
+3.替换ActivityThread的mPackages,mResourcePackages中的mLoaderApk中的application为realApplication。
+
+2）monkeyPatchExistingResources
+替换所有当前app的mAssets为newAssetManager。
+该方法的目的总结为：
+1.如果resource.ap_文件有改变，那么新建一个AssetManager对象newAssetManager，然后用newAssetManager对象替换所有当前Resource、Resource.Theme的mAssets成员变量。
+2.如果当前的已经有Activity启动了，还需要替换所有Activity中mAssets成员变量
+
+3）Server启动
+判断Server是否已经启动，如果没有启动，则启动Server
+4）调用realApplication的onCreate方法
+
+至此，我们的app就启动起来了。下一步就要分析，Server启动之后，到底是如何进行热部署、温部署和冷部署了。
+
+三、Server负责的热部署、温部署和冷部署
+1）
+socket开启后，开始读取数据，当读到1时，获取代码变化的ApplicationPatch列表，然后调用handlePatches来处理代码的变化。
+private void handle(DataInputStream input, DataOutputStream output)
+      throws IOException
+    {
+      long magic = input.readLong();
+      if (magic != 890269988L)
+      {
+        Log.w("InstantRun", "Unrecognized header format " +
+          Long.toHexString(magic));
+        return;
+      }
+      int version = input.readInt();
+
+      output.writeInt(4);
+      if (version != 4)
+      {
+        Log.w("InstantRun", "Mismatched protocol versions; app is using version 4 and tool is using version " + version);
+      }
+      else
+      {
+        int message;
+        for (;;)
+        {
+          message = input.readInt();
+          switch (message)
+          {
+          case 7:
+            if (Log.isLoggable("InstantRun", 2)) {
+              Log.v("InstantRun", "Received EOF from the IDE");
+            }
+            return;
+          case 2:
+            boolean active = Restarter.getForegroundActivity(Server.this.mApplication) != null;
+            output.writeBoolean(active);
+            if (Log.isLoggable("InstantRun", 2)) {
+              Log.v("InstantRun", "Received Ping message from the IDE; returned active = " + active);
+            }
+            break;
+          case 3:
+            String path = input.readUTF();
+            long size = FileManager.getFileSize(path);
+            output.writeLong(size);
+            if (Log.isLoggable("InstantRun", 2)) {
+              Log.v("InstantRun", "Received path-exists(" + path + ") from the " + "IDE; returned size=" + size);
+            }
+            break;
+          case 4:
+            long begin = System.currentTimeMillis();
+            String path = input.readUTF();
+            byte[] checksum = FileManager.getCheckSum(path);
+            if (checksum != null)
+            {
+              output.writeInt(checksum.length);
+              output.write(checksum);
+              if (Log.isLoggable("InstantRun", 2))
+              {
+                long end = System.currentTimeMillis();
+                String hash = new BigInteger(1, checksum).toString(16);
+                Log.v("InstantRun", "Received checksum(" + path + ") from the " + "IDE: took " + (end - begin) + "ms to compute " + hash);
+              }
+            }
+            else
+            {
+              output.writeInt(0);
+              if (Log.isLoggable("InstantRun", 2)) {
+                Log.v("InstantRun", "Received checksum(" + path + ") from the " + "IDE: returning <null>");
+              }
+            }
+            break;
+          case 5:
+            if (!authenticate(input)) {
+              return;
+            }
+            Activity activity = Restarter.getForegroundActivity(Server.this.mApplication);
+            if (activity != null)
+            {
+              if (Log.isLoggable("InstantRun", 2)) {
+                Log.v("InstantRun", "Restarting activity per user request");
+              }
+              Restarter.restartActivityOnUiThread(activity);
+            }
+            break;
+          case 1: //获取代码变化的ApplicationPatch列表，然后调用handlePatches来处理代码的变化。
+            if (!authenticate(input)) {
+              return;
+            }
+            List<ApplicationPatch> changes = ApplicationPatch.read(input);
+            if (changes != null)
+            {
+              boolean hasResources = Server.hasResources(changes);
+              int updateMode = input.readInt();
+              updateMode = Server.this.handlePatches(changes, hasResources, updateMode); //处理代码的变化
+
+              boolean showToast = input.readBoolean();
+
+              output.writeBoolean(true);
+
+              Server.this.restart(updateMode, hasResources, showToast);
+            }
+            break;
+          case 6:
+            String text = input.readUTF();
+            Activity foreground = Restarter.getForegroundActivity(Server.this.mApplication);
+            if (foreground != null) {
+              Restarter.showToast(foreground, text);
+            } else if (Log.isLoggable("InstantRun", 2)) {
+              Log.v("InstantRun", "Couldn't show toast (no activity) : " + text);
+            }
+            break;
+          }
+        }
+        if (Log.isLoggable("InstantRun", 6)) {
+          Log.e("InstantRun", "Unexpected message type: " + message);
+        }
+      }
+  }
+2）handlePatches
+  private int handlePatches(List<ApplicationPatch> changes, boolean hasResources, int updateMode)
+  {
+    if (hasResources) {
+      FileManager.startUpdate();
+    }
+    for (ApplicationPatch change : changes)
+    {
+      String path = change.getPath();
+      if (path.endsWith(".dex"))
+      {
+        handleColdSwapPatch(change); //如果后缀为“.dex”,冷部署处理
+
+        boolean canHotSwap = false;
+        for (ApplicationPatch c : changes) {
+          if (c.getPath().equals("classes.dex.3"))
+          {
+            canHotSwap = true;
+            break;
+          }
+        }
+        if (!canHotSwap) {
+          updateMode = 3;
+        }
+      }
+      else if (path.equals("classes.dex.3"))
+      {
+        updateMode = handleHotSwapPatch(updateMode, change); //热部署处理
+      }
+      else if (isResourcePath(path))
+      {
+        updateMode = handleResourcePatch(updateMode, change, path); //处理资源
+      }
+    }
+    if (hasResources) {
+      FileManager.finishUpdate(true);
+    }
+    return updateMode;
+  }
+
+1.如果后缀为“.dex”,冷部署处理handleColdSwapPatch
+2.如果后缀为“classes.dex.3”,热部署处理handleHotSwapPatch
+3.其他情况,温部署，处理资源handleResourcePatch
+
+1）handleColdSwapPatch冷部署
+private static void handleColdSwapPatch(ApplicationPatch patch)
+  {
+    if (patch.path.startsWith("slice-"))
+    {
+      File file = FileManager.writeDexShard(patch.getBytes(), patch.path); // data/data/{pkg}/files/instant-run/dex/
+    }
+  }
+把dex文件写到私有目录，等待整个app重启，重启之后，使用前面提到的IncrementalClassLoader加载dex即可。
+
+2）handleHotSwapPatch热部署
+ private int handleHotSwapPatch(int updateMode, ApplicationPatch patch)
+  {
+    try
+    {
+      String dexFile = FileManager.writeTempDexFile(patch.getBytes());
+      if (dexFile == null)
+      {
+        Log.e("InstantRun", "No file to write the code to");
+        return updateMode;
+      }
+
+      String nativeLibraryPath = FileManager.getNativeLibraryFolder().getPath();
+
+      DexClassLoader dexClassLoader = new DexClassLoader(dexFile, this.mApplication.getCacheDir().getPath(), nativeLibraryPath, getClass().getClassLoader());
+
+      Class<?> aClass = Class.forName("com.android.tools.fd.runtime.AppPatchesLoaderImpl", true, dexClassLoader);
+      try
+      {
+
+        PatchesLoader loader = (PatchesLoader)aClass.newInstance();
+        String[] getPatchedClasses = (String[])aClass.getDeclaredMethod("getPatchedClasses", new Class[0]).invoke(loader, new Object[0]);
+
+        if (!loader.load()) {
+          updateMode = 3;
+        }
+      }
+      catch (Exception e)
+      {
+        Log.e("InstantRun", "Couldn't apply code changes", e);
+        e.printStackTrace();
+        updateMode = 3;
+      }
+    }
+    catch (Throwable e)
+    {
+      Log.e("InstantRun", "Couldn't apply code changes", e);
+      updateMode = 3;
+    }
+    return updateMode;
+  }
+将patch的dex文件写入到临时目录，然后使用DexClassLoader去加载dex。然后反射调用AppPatchesLoaderImpl类的load方法，
+需要说明的是，AppPatchesLoaderImpl继承自抽象类AbstractPatchesLoaderImpl，并实现了抽象方法：getPatchedClasses
+如下是AbstractPatchesLoaderImpl抽象类的源码，注意看load方法：
+public boolean load()
+  {
+      for (String className : getPatchedClasses())
+      {
+        ClassLoader cl = getClass().getClassLoader();
+        Class<?> aClass = cl.loadClass(className + "$override"); //加载补丁类
+        Object o = aClass.newInstance();
+
+        Class<?> originalClass = cl.loadClass(className);  //原始的类
+        Field changeField = originalClass.getDeclaredField("$change"); //获取 $change 字段
+        changeField.setAccessible(true);
+
+        Object previous = changeField.get(null);
+        if (previous != null)
+        {
+          Field isObsolete = previous.getClass().getDeclaredField("$obsolete");
+          if (isObsolete != null) {
+            isObsolete.set(null, Boolean.valueOf(true));
+          }
+        }
+        changeField.set(null, o); //给$change字段赋值为补丁类
+      }
+    return true;
+  }
+
+
+1、在第一次构建apk时，在每一个类中注入了一个$change的成员变量，它实现了IncrementalChange接口，并在每一个方法中，插入了一段类似的逻辑
+IncrementalChange localIncrementalChange = $change;
+if (localIncrementalChange != null) {
+        localIncrementalChange.access$dispatch(
+        "onOptionsItemSelected.(Landroid/view/MenuItem;)Z",
+        new Object[] { this, paramMenuItem })).booleanValue();
+}
+就是当$change不为空的时候，执行IncrementalChange中的方法。
+
+2、当我们修改代码中方法的实现之后，点击InstantRun，它会生成对应的patch文件来记录你修改的内容。
+patch文件中的替换类是在所修改类名的后面追加$override，并实现IncrementalChange接口。
+比如,以MainActivity为例
+在目录../build/intermediates/transforms/instantRun/debug/folders/4000/5下查找到.
+生成了MainActivity$override类。
+
+3、生成AppPatchesLoaderImpl类，继承自AbstractPatchesLoaderImpl，并实现getPatchedClasses方法，来记录哪些类被修改了。
+比如，仍然在目录../build/intermediates/transforms/instantRun/debug/folders/4000/5下查找AppPatchesLoaderImpl.class
+public class AppPatchesLoaderImpl extends AbstractPatchesLoaderImpl {
+    public AppPatchesLoaderImpl() {
+    }
+    public String[] getPatchedClasses() { //记录修改了哪些类
+        return new String[]{"android.support.design.R$id", "mobctrl.net.testinstantrun.MainActivity$1", "mobctrl.net.testinstantrun.R$id", "mobctrl.net.testinstantrun.MainActivity", "android.support.v7.appcompat.R$id"};
+    }
+}
+4、调用load方法之后，根据getPatchedClasses返回的修改过的类的列表，去加载对应的$override类，
+然后把原有类的$change设置为对应的实现了IncrementalChange接口的$override类。
+然后等待restart之后生效
+
+-----------------------------------------总体总结
+总结起来，做了一下几件事：
+
+第一次编译apk：
+1.把Instant-Run.jar和instant-Run-bootstrap.jar打包到主dex中
+2.替换AndroidManifest.xml中的application配置
+3.使用asm工具，在每个类中添加$change，在每个方法前加逻辑
+4.把源代码编译成dex，然后存放到压缩包instant-run.zip中
+
+app运行期：
+1.获取更改后资源resource.ap_的路径
+2.设置ClassLoader。setupClassLoader：
+使用IncrementalClassLoader加载apk的代码，将原有的BootClassLoader → PathClassLoader改为BootClassLoader → IncrementalClassLoader → PathClassLoader继承关系。
+3.createRealApplication：
+创建apk真实的application
+4.monkeyPatchApplication
+反射替换ActivityThread中的各种Application成员变量
+5.monkeyPatchExistingResource
+反射替换所有存在的AssetManager对象
+6.调用realApplication的onCreate方法
+7.启动Server，Socket接收patch列表
+
+有代码修改时
+1.生成对应的$override类
+2.生成AppPatchesLoaderImpl类，记录修改的类列表
+3.打包成patch，通过socket传递给app
+4.app的server接收到patch之后，分别按照handleColdSwapPatch、handleHotSwapPatch、handleResourcePatch等待对patch进行处理
+5.restart使patch生效
+
+
+Instant Run的借鉴意义
+Android插件化框架改进
+Android热修复方案
+app加壳
